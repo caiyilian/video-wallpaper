@@ -95,6 +95,12 @@ user32.FindWindowExW.restype = wintypes.HWND
 user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
 user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
 user32.EnumChildWindows.argtypes = [wintypes.HWND, WNDENUMPROC, wintypes.LPARAM]
+user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetWindow.restype = wintypes.HWND
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetWindowRect.restype = wintypes.BOOL
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+user32.GetSystemMetrics.restype = ctypes.c_int
 user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
 user32.GetParent.argtypes = [wintypes.HWND]
 user32.GetParent.restype = wintypes.HWND
@@ -131,6 +137,9 @@ SWP_FRAMECHANGED = 0x0020
 
 MONITOR_DEFAULTTONEAREST = 2
 DESKTOP_SWITCHDESKTOP = 0x0100
+
+GW_CHILD = 5
+GW_HWNDNEXT = 2
 
 
 class MONITORINFO(ctypes.Structure):
@@ -179,13 +188,69 @@ def _icon_host() -> int:
     return 0
 
 
+def _children(hwnd: int) -> list[int]:
+    """直接子窗口，按 z 序（顶层在前）。"""
+    rows: list[int] = []
+    cur = user32.GetWindow(hwnd, GW_CHILD)
+    while cur:
+        rows.append(cur)
+        cur = user32.GetWindow(cur, GW_HWNDNEXT)
+    return rows
+
+
+def _covers_desktop(hwnd: int) -> bool:
+    """窗口是否至少铺满主显示器（用来排除输入法、托盘那些迷你 WorkerW）。"""
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    return (
+        rect.right - rect.left >= user32.GetSystemMetrics(0)
+        and rect.bottom - rect.top >= user32.GetSystemMetrics(1)
+    )
+
+
+def _pick_layer(host: int):
+    """在 host 周围找那块**真正在画壁纸**的空白 WorkerW。
+
+    两种桌面结构都得认：
+
+    Windows 10 / 早期 Win11（顶层兄弟结构）::
+
+        Progman
+        WorkerW          <- 图标层宿主（SHELLDLL_DefView 在它里面）
+        WorkerW          <- 壁纸层，Progman 的**顶层兄弟**，排在图标层后面
+
+    Windows 11 24H2+（实测 26200 / 25H2，嵌套结构）::
+
+        Progman
+          ├ SHELLDLL_DefView      图标层
+          └ WorkerW               壁纸层，变成了 Progman 的**子窗口**
+
+    只搜顶层兄弟会漏掉新结构，退回 Progman 兜底后视频窗口反而排在
+    壁纸层**下面**，被它不透明的背景整块盖住 —— 表现就是「有解码、没画面」。
+    """
+    sibling = user32.FindWindowExW(None, host, "WorkerW", None)
+    if sibling and user32.IsWindowVisible(sibling) and _covers_desktop(sibling):
+        return sibling, "behind"
+
+    for child in _children(host):
+        if (
+            _class_name(child) == "WorkerW"
+            and user32.IsWindowVisible(child)
+            and _covers_desktop(child)
+        ):
+            return child, "nested"
+    return None
+
+
 def find_wallpaper_target(timeout: float = 3.0, spawn: bool = True):
     """定位可以承载视频窗口的「壁纸层」。
 
     返回 (hwnd, mode)：
-      mode = "behind"  -> 图标层之后的空白 WorkerW（标准壁纸层，最理想）
-      mode = "inside"  -> 图标层宿主自身，需把视频压到其子窗口最底层
-      mode = "progman" -> 兜底用 Progman
+      mode = "behind" -> 图标层之后的顶层 WorkerW（Win10 老结构，最理想）
+      mode = "nested" -> Progman 内部、与图标层并列的 WorkerW（Win11 24H2+）
+      mode = "inside" -> 图标层宿主自身（找不到空白层时的兜底）
+      mode = "progman" -> 最后兜底用 Progman
 
     关键：0x052C 之后资源管理器是**异步**创建 WorkerW 的，
     必须轮询等待，否则会枚举不到。
@@ -209,9 +274,9 @@ def find_wallpaper_target(timeout: float = 3.0, spawn: bool = True):
     while True:
         host = _icon_host()
         if host:
-            nxt = user32.FindWindowExW(None, host, "WorkerW", None)
-            if nxt:
-                return nxt, "behind"
+            layer = _pick_layer(host)
+            if layer:
+                return layer
         if time.monotonic() >= deadline:
             break
         time.sleep(0.2)
@@ -411,9 +476,22 @@ class Surface:
             f"父客户区坐标=({point.x},{point.y}) 尺寸={w}x{h}")
 
     def is_attached(self) -> bool:
-        """窗口是否还挂在有效的父窗口下。"""
-        parent = int(user32.GetParent(self.hwnd) or 0)
-        return bool(parent) and bool(user32.IsWindow(parent))
+        """窗口是否仍然挂在我们嵌入的那块壁纸层下（沿父链判断）。
+
+        只看「有父窗口」不够：资源管理器重启后窗口会被系统重新挂到
+        Progman 上，父窗口依然有效，但壁纸已经看不见了。
+        """
+        if not self.workerw or not user32.IsWindow(self.workerw):
+            return False
+
+        seen: set[int] = set()
+        cur = int(user32.GetParent(self.hwnd) or 0)
+        while cur and cur not in seen:
+            if cur == self.workerw:
+                return True
+            seen.add(cur)
+            cur = int(user32.GetParent(cur) or 0)
+        return False
 
     # ---- 播放控制 ----
 

@@ -119,9 +119,20 @@ python tools/selfcheck.py      # 自检：显示器 / 壁纸层 / 视频窗口�
 ## 工作原理
 
 Windows 桌面由 `Progman`、`WorkerW`、`SHELLDLL_DefView` 三层窗口协作绘制。
-向 `Progman` 发送未公开消息 `0x052C`，资源管理器会分裂出一个**新的顶层 `WorkerW`** 作为纯壁纸层；
+向 `Progman` 发送未公开消息 `0x052C`，资源管理器会分裂出一个**新的 `WorkerW`** 作为纯壁纸层；
 拿到它的 HWND 后，把无边框、无焦点、不抢激活的视频窗口 `SetParent` 挂上去，
 视频就显示在桌面图标下方、所有普通窗口下方。
+
+这块新 `WorkerW` 挂在哪，随 Windows 版本变过：
+
+| 系统 | 结构 | 日志里的 `mode` |
+|---|---|---|
+| Windows 10 / 早期 Win11 | 新的 `WorkerW` 是 `Progman` 的**顶层兄弟**，排在图标层宿主后面 | `behind` |
+| Windows 11 24H2+（实测 26200 / 25H2） | 新的 `WorkerW` 变成 **`Progman` 的子窗口**，与 `SHELLDLL_DefView` 并列 | `nested` |
+
+两种都要认。只搜顶层兄弟时，新系统上会退回「挂到 `Progman`」的兜底路径，
+视频窗口反而排到壁纸层**下面**，被它不透明的背景整块盖住——
+表现就是「进程在解码、内存涨了，桌面却一动不动」。
 
 ## 排查
 
@@ -182,6 +193,33 @@ wallpaper = WallpaperApp(app)    # ✓ 正确写法
 不声明参数类型时，回调函数指针可能被截断成 32 位，导致枚举结果不可信。
 本项目所有 Win32 调用都显式声明了 `argtypes` / `restype`。
 
+### 5. Win11 24H2+ 的壁纸层是 `Progman` 的**子窗口**，不是顶层兄弟
+
+Win10 上 `0x052C` 之后的结构是 `Progman` → `WorkerW`（图标层）→ `WorkerW`（壁纸层），壁纸层是**顶层**窗口，
+用 `FindWindowExW(NULL, 图标层宿主, "WorkerW", NULL)` 找它后面的兄弟即可。
+
+Win11 24H2（实测 Build 26200）上，新建的 `WorkerW` 直接挂在 `Progman` 里，和 `SHELLDLL_DefView` 并列：
+
+```
+Progman 0x00010208  (1920×1080)
+ ├ SHELLDLL_DefView  0x0001020C   ← 图标层，背景透明
+ ├ WorkerW           0x00030B32   ← 壁纸层（Progman 的子窗口）
+ └ 视频窗口          0x002708D0   ← 挂错位置时就在这儿，排在壁纸层下面
+```
+
+此时顶层兄弟搜索必然失败，`_icon_host()` 返回的是 `Progman` 本身，
+于是退回「挂到 Progman」的兜底分支。而那块 `WorkerW` 是**不透明**的（桌面背景由它绘制），
+视频被压在它下面 → 解码照跑、内存照涨、屏幕上一片旧壁纸。
+
+`_pick_layer()` 因此会两种结构都试：先找顶层兄弟，再遍历 `Progman` 的直接子窗口找那块铺满主屏的 `WorkerW`，
+并用「尺寸不小于主显示器」把输入法、托盘那些迷你 `WorkerW` 排除掉。
+
+### 6. 判断「还挂着」不能只看父窗口是否存在
+
+资源管理器重启后，系统会把孤儿子窗口重新挂到 `Progman` 上——父窗口依然有效，
+但壁纸已经跑到壁纸层下面了。所以 `is_attached()` 改成沿父链追到**当初嵌入的那块壁纸层**，
+对不上就交给看门狗重新挂载。
+
 ## 从源码打包
 
 ```bash
@@ -192,6 +230,12 @@ python -m PyInstaller video_wallpaper.spec --noconfirm
 
 `video_wallpaper.spec` 里排除了大量用不到的 Qt 模块（WebEngine、Quick/QML、3D、Charts…），
 否则体积会大好几倍。实测单文件 exe 54 MB，冷启动（含解包）约 1.4 秒。
+
+> **打包环境必须装完整的 `PySide6`，不能只装 `PySide6-Essentials`。**
+> 从 Qt 6.11 起，多媒体后端（`ffmpegmediaplugin.dll` + `avcodec` / `avformat` / `avutil`）
+> 放在 **`PySide6-Addons`** 里，Essentials 只有 `QtMultimedia.pyd` 壳子。
+> 只装 Essentials 也能打包成功、exe 也能启动，但 `QMediaPlayer` 没有解码后端，
+> **壁纸是纯黑的，而且日志里一行报错都没有**——进程内存只有 80 MB 左右就是它（正常解码时几百 MB）。
 
 ## 环境要求
 

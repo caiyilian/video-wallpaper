@@ -15,3 +15,6 @@ dist/
 # 壁纸视频体积大，不入库（按 README 里的 ffmpeg 命令自行生成）
 videos/
 VideoWallpaper.exe
+
+# WorkBuddy 工作区记忆/会话数据，不随仓库分发
+.workbuddy/
