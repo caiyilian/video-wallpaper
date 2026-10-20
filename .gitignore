@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# 运行时生成
+video-wallpaper.log
+settings.json
+
+# 壁纸视频体积大，不入库（按 README 里的 ffmpeg 命令自行生成）
+videos/
