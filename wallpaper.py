@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""video-wallpaper —— 把视频设成 Windows 桌面动态壁纸。
+"""video-wallpaper —— 把视频设成 Windows 桌面动态壁纸（支持多显示器）。
 
 用法（无参数，直接运行）：
 
@@ -18,14 +18,17 @@ Windows 桌面由 Progman / WorkerW / SHELLDLL_DefView 三层窗口协作绘制�
 循环播放的视频窗口 SetParent 挂上去，视频就显示在桌面图标下方、
 所有普通窗口下方，从而实现「动态壁纸」，且不依赖任何第三方软件。
 
+多显示器：每个显示器对应一个视频窗口，都挂在同一个壁纸层 WorkerW 下，
+各自按自己的显示器几何摆放，可以配不同的视频。
+
 注意：0x052C 创建窗口是异步的，发完消息必须轮询等待，不能立刻枚举。
 
 资源占用控制
 ------------
-* 视频无音轨时不做任何音频解码（本项目默认视频即无音轨）；
+* 视频无音轨时不做任何音频解码；
 * 前台出现占满整屏的窗口（游戏 / 全屏播放器）时自动暂停解码；
 * 锁屏 / 远程会话断开时自动暂停解码；
-* 视频解码走 D3D11 硬解，4K60 实测 CPU 占用接近 0。
+* 视频解码走 D3D11 硬解。
 """
 
 from __future__ import annotations
@@ -62,9 +65,6 @@ else:
 CONFIG_PATH = os.path.join(APP_DIR, "settings.json")
 LOG_PATH = os.path.join(APP_DIR, "video-wallpaper.log")
 
-# 首次运行没有配置时留空，由托盘菜单「更换壁纸视频…」选择
-DEFAULT_VIDEO = ""
-
 try:
     import autostart
 except ImportError:          # 单独拷贝 wallpaper.py 运行时也不至于崩
@@ -78,6 +78,7 @@ def log(msg: str) -> None:
             fp.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
     except OSError:
         pass
+
 
 # --------------------------------------------------------------------------
 # Win32 部分
@@ -231,17 +232,16 @@ def is_session_locked() -> bool:
     return False
 
 
-def foreground_is_fullscreen(own_hwnd: int) -> bool:
+def foreground_is_fullscreen(ignore_hwnds: set[int]) -> bool:
     """前台窗口是否占满整块屏幕（游戏、全屏播放器等）。"""
     hwnd = user32.GetForegroundWindow()
-    if not hwnd or hwnd == own_hwnd:
+    if not hwnd or hwnd in ignore_hwnds:
         return False
     if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
         return False
 
-    cls = ctypes.create_unicode_buffer(64)
-    user32.GetClassNameW(hwnd, cls, 64)
-    if cls.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+    cls = _class_name(hwnd)
+    if cls in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
         return False
 
     rect = wintypes.RECT()
@@ -286,8 +286,7 @@ def make_tray_icon() -> QIcon:
 # --------------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
-    "video": DEFAULT_VIDEO,
-    "screen": "",
+    "monitors": {},                # {"显示器名": "视频路径"}
     "pause_on_fullscreen": True,
 }
 
@@ -299,6 +298,16 @@ def load_config() -> dict:
             cfg.update(json.load(fp))
     except (OSError, ValueError):
         pass
+
+    if not isinstance(cfg.get("monitors"), dict):
+        cfg["monitors"] = {}
+
+    # 兼容旧版单显示器配置：{"video": ..., "screen": ...}
+    old_video = cfg.pop("video", "")
+    old_screen = cfg.pop("screen", "")
+    if old_video and not cfg["monitors"]:
+        cfg["monitors"] = {old_screen or "": old_video}
+
     return cfg
 
 
@@ -311,6 +320,130 @@ def save_config(cfg: dict) -> None:
 
 
 # --------------------------------------------------------------------------
+# 一个显示器上的视频窗口
+# --------------------------------------------------------------------------
+
+class Surface:
+    """某个显示器上的一块视频壁纸（一个播放器 + 一个窗口）。"""
+
+    def __init__(self, app: QApplication, screen_name: str, video: str):
+        self.app = app
+        self.screen_name = screen_name
+        self.video_path = video
+        self.workerw = 0
+        self.embedded = False
+
+        self.player = QMediaPlayer()
+        self.player.setLoops(QMediaPlayer.Loops.Infinite)   # 无缝循环
+        self.player.errorOccurred.connect(self._on_error)
+
+        self.widget = QVideoWidget()
+        self.widget.setWindowTitle(APP_NAME)
+        self.widget.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
+        self.widget.setAttribute(Qt.WA_NativeWindow, True)
+        self.widget.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.widget.setAspectRatioMode(Qt.KeepAspectRatio)  # 保持比例，两侧留黑
+        self.widget.setStyleSheet("background:#000;")
+        self.player.setVideoOutput(self.widget)
+
+    # ---- 窗口句柄与存在性 ----
+
+    @property
+    def hwnd(self) -> int:
+        return int(self.widget.winId())
+
+    def screen(self):
+        for s in self.app.screens():
+            if s.name() == self.screen_name:
+                return s
+        return None
+
+    # ---- 嵌入桌面底层 ----
+
+    def embed(self, workerw: int) -> None:
+        self.workerw = workerw
+        self.widget.show()
+        hwnd = self.hwnd
+
+        # 改成子窗口样式，并确保不抢焦点、不出现在任务栏 / Alt-Tab
+        style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+        user32.SetWindowLongW(hwnd, GWL_STYLE, (style | WS_CHILD) & ~WS_POPUP)
+        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        user32.SetWindowLongW(
+            hwnd, GWL_EXSTYLE,
+            (ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW,
+        )
+
+        user32.SetParent(hwnd, workerw)
+        self.embedded = True
+        self.apply_geometry()
+
+    def apply_geometry(self) -> None:
+        """摆到本显示器对应的物理区域上，并压到最底层。
+
+        坐标系注意：窗口此时是 WorkerW 的子窗口，SetWindowPos 用的是
+        **父窗口客户区坐标**；壁纸层 WorkerW 的客户区覆盖整个虚拟桌面，
+        多显示器时其左上角通常是负坐标。所以必须先把屏幕坐标用
+        MapWindowPoints 换算成父客户区坐标，否则会偏到别的显示器上。
+        """
+        if not self.embedded or not self.workerw or not user32.IsWindow(self.workerw):
+            return
+
+        screen = self.screen()
+        if screen is None:
+            return
+
+        geo = screen.geometry()
+        dpr = screen.devicePixelRatio()
+        sx = int(round(geo.x() * dpr))
+        sy = int(round(geo.y() * dpr))
+        w = int(round(geo.width() * dpr))
+        h = int(round(geo.height() * dpr))
+
+        point = POINT(sx, sy)
+        user32.MapWindowPoints(None, self.workerw, ctypes.byref(point), 1)
+
+        user32.SetWindowPos(
+            self.hwnd, wintypes.HWND(HWND_BOTTOM), point.x, point.y, w, h,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+        )
+        log(f"[{self.screen_name}] 摆放：屏幕坐标=({sx},{sy}) "
+            f"父客户区坐标=({point.x},{point.y}) 尺寸={w}x{h}")
+
+    def is_attached(self) -> bool:
+        """窗口是否还挂在有效的父窗口下。"""
+        parent = int(user32.GetParent(self.hwnd) or 0)
+        return bool(parent) and bool(user32.IsWindow(parent))
+
+    # ---- 播放控制 ----
+
+    def load(self, path: str) -> None:
+        self.video_path = path
+        if not path or not os.path.isfile(path):
+            log(f"[{self.screen_name}] 视频不存在，跳过：{path!r}")
+            return
+        self.player.setSource(QUrl.fromLocalFile(path))
+        self.player.play()
+        log(f"[{self.screen_name}] 载入视频：{path}")
+
+    def set_playing(self, playing: bool) -> None:
+        if playing:
+            self.player.play()
+        else:
+            self.player.pause()
+
+    def close(self) -> None:
+        self.player.stop()
+        self.player.setVideoOutput(None)
+        self.widget.hide()
+        self.widget.deleteLater()
+        self.embedded = False
+
+    def _on_error(self, *_args) -> None:
+        log(f"[{self.screen_name}] 播放出错：{self.player.errorString()}")
+
+
+# --------------------------------------------------------------------------
 # 主程序
 # --------------------------------------------------------------------------
 
@@ -319,25 +452,13 @@ class WallpaperApp:
         self.app = app
         self.cfg = load_config()
 
-        self.player = QMediaPlayer()
-        self.player.setLoops(QMediaPlayer.Loops.Infinite)   # 无缝循环
-        self.player.errorOccurred.connect(self._on_media_error)
-
-        self.video = QVideoWidget()
-        self.video.setWindowTitle(APP_NAME)
-        self.video.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
-        self.video.setAttribute(Qt.WA_NativeWindow, True)
-        self.video.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        self.video.setAspectRatioMode(Qt.KeepAspectRatio)   # 保持比例，两侧留黑
-        self.video.setStyleSheet("background:#000;")
-        self.player.setVideoOutput(self.video)
-
-        self.target = 0
+        self.workerw = 0
         self.mode = "none"
-        self.embed_ok = False
+        self.surfaces: dict[str, Surface] = {}
         self.user_paused = False
         self.auto_paused_reason = ""      # "fullscreen" / "locked"
 
+        self._normalize_monitor_keys()
         self._build_tray()
 
         # 桌面被重建 / 资源管理器重启时自动重新贴回底层
@@ -353,21 +474,34 @@ class WallpaperApp:
         self.guard.start()
 
         # 显示器插拔 / 改分辨率后重新摆放
-        app.screenAdded.connect(self.resize_to_screen)
-        app.screenRemoved.connect(self.resize_to_screen)
+        app.screenAdded.connect(self._on_screens_changed)
+        app.screenRemoved.connect(self._on_screens_changed)
         for scr in app.screens():
-            scr.geometryChanged.connect(self.resize_to_screen)
+            scr.geometryChanged.connect(self._on_screens_changed)
 
         self.embed()
-        self.load_video(self.cfg.get("video", DEFAULT_VIDEO))
+        self._sync_surfaces()
+
+    # ---------------- 配置归一 ----------------
+
+    def _normalize_monitor_keys(self) -> None:
+        """把旧配置里空显示器名（表示主屏）解析成真实名字。"""
+        raw = dict(self.cfg.get("monitors", {}))
+        if "" in raw:
+            prim = self.app.primaryScreen()
+            name = prim.name() if prim is not None else ""
+            video = raw.pop("")
+            if name and name not in raw:
+                raw[name] = video
+            save_config(self.cfg)
+        self.cfg["monitors"] = raw
 
     # ---------------- 桌面嵌入 ----------------
 
     def embed(self) -> None:
-        """把视频窗口挂到桌面图标下方那一层。"""
+        """找到壁纸层，并把所有视频窗口挂上去。"""
         target, mode = find_wallpaper_target()
         if not target:
-            self.embed_ok = False
             log("embed 失败：未找到桌面壁纸层 WorkerW")
             self.tray.showMessage(
                 APP_NAME, "未能找到桌面壁纸层（WorkerW），壁纸无法显示。",
@@ -375,129 +509,79 @@ class WallpaperApp:
             )
             return
 
-        self.target, self.mode = target, mode
+        self.workerw, self.mode = target, mode
+        for surface in self.surfaces.values():
+            surface.embed(target)
 
-        self.video.show()
-        hwnd = int(self.video.winId())
-
-        # 改成子窗口样式，并确保不抢焦点、不出现在任务栏 / Alt-Tab
-        style = user32.GetWindowLongW(hwnd, GWL_STYLE)
-        user32.SetWindowLongW(hwnd, GWL_STYLE, (style | WS_CHILD) & ~WS_POPUP)
-        ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        user32.SetWindowLongW(
-            hwnd, GWL_EXSTYLE,
-            (ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW,
-        )
-
-        user32.SetParent(hwnd, target)
-        self.embed_ok = True
-        self.resize_to_screen()
-
-        actual = int(user32.GetParent(hwnd) or 0)
-        log(f"embed 完成：mode={mode} target=0x{target:08X} "
-            f"video_hwnd=0x{hwnd:08X} 实际父窗口=0x{actual:08X} "
-            f"({_class_name(actual) if actual else 'TOP-LEVEL'})")
-
-    def resize_to_screen(self, *_args) -> None:
-        """把视频窗口摆到目标显示器的物理区域上，并压到最底层。
-
-        注意坐标系：窗口此时已经是 WorkerW 的子窗口，SetWindowPos 用的是
-        **父窗口客户区坐标**；而 WorkerW 的客户区覆盖整个虚拟桌面，其左上角
-        并不在 (0, 0)（多显示器时通常是个负数）。所以必须先把屏幕坐标用
-        MapWindowPoints 换算成父窗口客户区坐标，否则整体会偏移到别的显示器上。
-        """
-        if not self.target or not user32.IsWindow(self.target):
-            return
-
-        screen = self.current_screen()
-        if screen is None:
-            return
-
-        geo = screen.geometry()
-        dpr = screen.devicePixelRatio()
-        w = int(round(geo.width() * dpr))
-        h = int(round(geo.height() * dpr))
-        sx = int(round(geo.x() * dpr))
-        sy = int(round(geo.y() * dpr))
-
-        point = POINT(sx, sy)
-        user32.MapWindowPoints(None, self.target, ctypes.byref(point), 1)
-
-        hwnd = int(self.video.winId())
-        user32.SetWindowPos(
-            hwnd, wintypes.HWND(HWND_BOTTOM), point.x, point.y, w, h,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
-        )
-        log(f"摆放：屏幕={screen.name()} 屏幕坐标=({sx},{sy}) "
-            f"父客户区坐标=({point.x},{point.y}) 尺寸={w}x{h}")
-
-    # ---------------- 显示器选择 ----------------
-
-    def current_screen(self):
-        """按配置挑显示器；配置为空或该显示器已拔掉时回落到主显示器。"""
-        want = self.cfg.get("screen", "")
-        screens = self.app.screens()
-        for s in screens:
-            if s.name() == want:
-                return s
-        return self.app.primaryScreen()
-
-    def _on_pick_screen(self, name: str) -> None:
-        self.cfg["screen"] = name
-        save_config(self.cfg)
-        log(f"切换显示器 -> {name}")
-        self.resize_to_screen()
-        self._refresh_menu()
+    def _on_screens_changed(self, *_args) -> None:
+        log("检测到显示器变化，重新同步")
+        self._sync_surfaces()
 
     def _check_embed(self) -> None:
-        """周期性确认窗口仍然挂在有效的父窗口下。
+        """周期性确认窗口仍然挂在有效父窗口下（资源管理器重启后自动修复）。"""
+        configured = {k: v for k, v in self.cfg.get("monitors", {}).items() if v}
+        alive = [s for s in self.surfaces.values() if s.embedded]
 
-        资源管理器重启 / 切换分辨率后父窗口会被销毁，此时需要重新挂载。
-        不依赖记下来的 target，而是直接问系统「我的父窗口还在不在」。
-        """
-        if not self.embed_ok:
+        # 有配置但一个窗口都没有 —— 说明首次嵌入失败，重试
+        if configured and not alive:
+            log("看门狗：尚未挂载任何窗口，重新尝试")
             self.embed()
+            self._sync_surfaces()
             return
-        hwnd = int(self.video.winId())
-        parent = int(user32.GetParent(hwnd) or 0)
-        if not parent or not user32.IsWindow(parent):
+
+        if any(not s.is_attached() for s in alive):
             log("看门狗：父窗口失效，重新挂载")
-            self.embed_ok = False
             self.embed()
+
+    # ---------------- 显示器 ↔ 视频 的同步 ----------------
+
+    def _sync_surfaces(self) -> None:
+        """让「配置里的显示器」与「实际存在的窗口」保持一致。"""
+        if not self.workerw:
+            return
+
+        want = {k: v for k, v in self.cfg.get("monitors", {}).items() if v}
+        screens = {s.name() for s in self.app.screens()}
+
+        # 移除：已不再配置的、显示器已拔掉的、视频路径变了的
+        for name in list(self.surfaces):
+            surface = self.surfaces[name]
+            gone = name not in want or name not in screens
+            changed = not gone and surface.video_path != want[name]
+            if gone:
+                log(f"[{name}] 关闭该显示器的壁纸")
+                surface.close()
+                del self.surfaces[name]
+            elif changed:
+                log(f"[{name}] 切换视频")
+                surface.load(want[name])
+
+        # 新增：新配置的显示器
+        for name, video in want.items():
+            if name in self.surfaces or name not in screens:
+                continue
+            surface = Surface(self.app, name, video)
+            surface.embed(self.workerw)
+            surface.load(video)
+            self.surfaces[name] = surface
+
+        # 已存在的窗口重新摆一次位置（分辨率可能变了）
+        for surface in self.surfaces.values():
+            surface.apply_geometry()
+
+        log(f"同步完成：壁纸层=0x{self.workerw:08X}（{self.mode}），"
+            f"已挂载 {len(self.surfaces)} 个显示器：{', '.join(self.surfaces) or '无'}")
+        self._refresh_menu()
 
     # ---------------- 播放控制 ----------------
 
-    def load_video(self, path: str) -> None:
-        if not path:
-            self.tray.showMessage(
-                APP_NAME, "还没有设置壁纸视频。\n右键托盘图标 → 更换壁纸视频…",
-                QSystemTrayIcon.Information, 6000,
-            )
-            self._refresh_menu()
-            return
-        if not os.path.isfile(path):
-            self.tray.showMessage(
-                APP_NAME, f"找不到视频文件：\n{path}", QSystemTrayIcon.Warning, 6000,
-            )
-            self._refresh_menu()
-            return
-
-        self.cfg["video"] = path
-        save_config(self.cfg)
-        self.player.setSource(QUrl.fromLocalFile(path))
-        self.player.play()
-        self.user_paused = False
-        self.auto_paused_reason = ""
-        log(f"载入视频：{path}")
-        self._refresh_menu()
-
-    def set_play(self, playing: bool) -> None:
+    def set_play_all(self, playing: bool) -> None:
         self.user_paused = not playing
         if playing:
             self.auto_paused_reason = ""
-            self.player.play()
-        else:
-            self.player.pause()
+        for surface in self.surfaces.values():
+            surface.set_playing(playing)
+        log("全部" + ("继续播放" if playing else "暂停"))
         self._refresh_menu()
 
     def _check_auto_pause(self) -> None:
@@ -508,26 +592,18 @@ class WallpaperApp:
         if is_session_locked():
             reason = "locked"
         elif self.cfg.get("pause_on_fullscreen", True):
-            if foreground_is_fullscreen(int(self.video.winId())):
+            ignore = {s.hwnd for s in self.surfaces.values()}
+            if foreground_is_fullscreen(ignore):
                 reason = "fullscreen"
 
         if reason == self.auto_paused_reason:
             return
 
         self.auto_paused_reason = reason
-        if reason:
-            self.player.pause()
-            log(f"自动暂停（{reason}）")
-        else:
-            self.player.play()
-            log("自动恢复播放")
+        for surface in self.surfaces.values():
+            surface.set_playing(not reason)
+        log(f"自动{'暂停（' + reason + '）' if reason else '恢复播放'}")
         self._refresh_menu()
-
-    def _on_media_error(self, *_args) -> None:
-        self.tray.showMessage(
-            APP_NAME, f"视频播放出错：{self.player.errorString()}",
-            QSystemTrayIcon.Warning, 6000,
-        )
 
     # ---------------- 托盘 ----------------
 
@@ -545,13 +621,10 @@ class WallpaperApp:
         self.act_toggle = QAction("暂停播放", self.menu)
         self.act_toggle.triggered.connect(self._on_toggle)
         self.menu.addAction(self.act_toggle)
+        self.menu.addSeparator()
 
-        self.act_change = QAction("更换壁纸视频…", self.menu)
-        self.act_change.triggered.connect(self._on_change)
-        self.menu.addAction(self.act_change)
-
-        self.menu_screen = self.menu.addMenu("显示在哪个显示器")
-        self.menu_screen.aboutToShow.connect(self._rebuild_screen_menu)
+        self.menu_monitors = self.menu.addMenu("显示器 / 更换视频")
+        self.menu_monitors.aboutToShow.connect(self._rebuild_monitor_menu)
         self.menu.addSeparator()
 
         self.act_pause_fs = QAction("全屏应用时自动暂停", self.menu)
@@ -578,20 +651,53 @@ class WallpaperApp:
         self.tray.show()
         self._refresh_menu()
 
+    def _rebuild_monitor_menu(self) -> None:
+        """每次打开菜单时重建（显示器插拔后自动刷新）。"""
+        self.menu_monitors.clear()
+        configured = self.cfg.get("monitors", {})
+
+        for screen in self.app.screens():
+            geo = screen.geometry()
+            orient = "竖屏" if geo.height() > geo.width() else "横屏"
+            sub = self.menu_monitors.addMenu(
+                f"{screen.name()}  {geo.width()}×{geo.height()}  {orient}"
+            )
+
+            video = configured.get(screen.name(), "")
+            head = sub.addAction(
+                os.path.basename(video) if video else "（未设置）"
+            )
+            head.setEnabled(False)
+            sub.addSeparator()
+
+            pick = sub.addAction("选择视频…" if not video else "更换视频…")
+            pick.triggered.connect(
+                lambda _=False, n=screen.name(): self._on_pick_video(n)
+            )
+
+            if video:
+                remove = sub.addAction("移除这个显示器的壁纸")
+                remove.triggered.connect(
+                    lambda _=False, n=screen.name(): self._on_clear_monitor(n)
+                )
+
+        if not self.app.screens():
+            head = self.menu_monitors.addAction("未检测到显示器")
+            head.setEnabled(False)
+
     def _refresh_menu(self) -> None:
-        name = os.path.basename(self.cfg.get("video", "")) or "（未设置）"
-        state = "播放中"
-        if self.user_paused:
+        count = len(self.surfaces)
+        if not count:
+            state = "未设置"
+        elif self.user_paused:
             state = "已暂停"
         elif self.auto_paused_reason == "fullscreen":
             state = "已暂停（全屏应用）"
         elif self.auto_paused_reason == "locked":
             state = "已暂停（锁屏）"
-        if not self.embed_ok:
-            state = "未挂载"
-        screen = self.current_screen()
-        where = screen.name() if screen is not None else "?"
-        self.act_status.setText(f"{state} · {where[:18]} · {name[:18]}")
+        else:
+            state = "播放中"
+        self.act_status.setText(f"{state} · {count} 个显示器")
         self.act_toggle.setText("继续播放" if self.user_paused else "暂停播放")
         if autostart is not None:
             self.act_autostart.setChecked(self._autostart_enabled())
@@ -605,30 +711,33 @@ class WallpaperApp:
         except OSError:
             return False
 
-    def _rebuild_screen_menu(self) -> None:
-        """每次打开菜单时重建显示器列表（插拔显示器后自动刷新）。"""
-        self.menu_screen.clear()
-        cur = self.current_screen()
-        for s in self.app.screens():
-            g = s.geometry()
-            orient = "竖屏" if g.height() > g.width() else "横屏"
-            act = self.menu_screen.addAction(
-                f"{s.name()}  {g.width()}×{g.height()}  {orient}"
-            )
-            act.setCheckable(True)
-            act.setChecked(s is cur)
-            act.triggered.connect(lambda _=False, n=s.name(): self._on_pick_screen(n))
-
     def _on_toggle(self) -> None:
-        self.set_play(bool(self.user_paused))
+        self.set_play_all(bool(self.user_paused))
 
-    def _on_change(self) -> None:
-        start_dir = os.path.dirname(self.cfg.get("video") or "") or APP_DIR
+    def _on_pick_video(self, screen_name: str) -> None:
+        configured = self.cfg.get("monitors", {})
+        current = configured.get(screen_name, "")
+        start_dir = os.path.dirname(current) if current else APP_DIR
+
         path, _ = QFileDialog.getOpenFileName(
-            None, "选择壁纸视频", start_dir, "视频文件 (*.mp4 *.mkv *.webm *.avi *.mov)"
+            None, f"为 {screen_name} 选择壁纸视频", start_dir,
+            "视频文件 (*.mp4 *.mkv *.webm *.avi *.mov)",
         )
-        if path:
-            self.load_video(path)
+        if not path:
+            return
+
+        configured[screen_name] = path
+        self.cfg["monitors"] = configured
+        save_config(self.cfg)
+        log(f"[{screen_name}] 用户指定视频：{path}")
+        self._sync_surfaces()
+
+    def _on_clear_monitor(self, screen_name: str) -> None:
+        configured = self.cfg.get("monitors", {})
+        configured.pop(screen_name, None)
+        self.cfg["monitors"] = configured
+        save_config(self.cfg)
+        self._sync_surfaces()
 
     def _on_toggle_pause_fs(self, checked: bool) -> None:
         self.cfg["pause_on_fullscreen"] = bool(checked)
@@ -647,9 +756,9 @@ class WallpaperApp:
     def _on_quit(self) -> None:
         self.watchdog.stop()
         self.guard.stop()
-        self.player.stop()
-        self.player.setVideoOutput(None)
-        self.video.hide()
+        for surface in self.surfaces.values():
+            surface.close()
+        self.surfaces.clear()
         self.tray.hide()
         self.app.quit()
 
@@ -671,7 +780,7 @@ def main() -> int:
         pass
     log("=== 启动 ===")
 
-    # pythonw 没有控制台，未捕获异常必须落盘，否则崩溃是无声的
+    # pythonw / --noconsole 没有控制台，未捕获异常必须落盘，否则崩溃是无声的
     def _hook(exc_type, exc, tb):
         import traceback
         log("!!! 未捕获异常：\n" + "".join(traceback.format_exception(exc_type, exc, tb)))
