@@ -5,5 +5,13 @@ __pycache__/
 video-wallpaper.log
 settings.json
 
+# 本机路径写死的启动脚本，仓库里只保留 .example 模板
+start.vbs
+
+# 打包产物（exe 体积太大，走 GitHub Release 分发）
+build/
+dist/
+
 # 壁纸视频体积大，不入库（按 README 里的 ffmpeg 命令自行生成）
 videos/
+VideoWallpaper.exe

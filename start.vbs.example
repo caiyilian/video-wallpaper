@@ -1,0 +1,12 @@
+' 以「脚本方式」静默启动（不用 exe 时用这个）。
+'
+' 用法：
+'   1. 把本文件复制一份改名成 start.vbs
+'   2. 把下面两处路径换成你自己机器上的实际路径
+'
+' 其中 pythonw.exe 是「无控制台窗口」的解释器，在 Python 安装目录或其 venv 的
+' Scripts 目录下。若不改名直接双击本文件是没有效果的。
+
+Set ws = CreateObject("Wscript.Shell")
+ws.CurrentDirectory = "C:\path\to\video-wallpaper"
+ws.Run """C:\path\to\pythonw.exe"" ""C:\path\to\video-wallpaper\wallpaper.py""", 0, False

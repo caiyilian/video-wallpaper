@@ -52,11 +52,23 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon
 
 APP_NAME = "VideoWallpaper"
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 打包成 exe 后 __file__ 指向临时解包目录，配置和日志必须放到 exe 旁边
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 CONFIG_PATH = os.path.join(APP_DIR, "settings.json")
 LOG_PATH = os.path.join(APP_DIR, "video-wallpaper.log")
 
-DEFAULT_VIDEO = r"C:\path\to\your-video.mp4"
+# 首次运行没有配置时留空，由托盘菜单「更换壁纸视频…」选择
+DEFAULT_VIDEO = ""
+
+try:
+    import autostart
+except ImportError:          # 单独拷贝 wallpaper.py 运行时也不至于崩
+    autostart = None
 
 
 def log(msg: str) -> None:
@@ -456,7 +468,14 @@ class WallpaperApp:
     # ---------------- 播放控制 ----------------
 
     def load_video(self, path: str) -> None:
-        if not path or not os.path.isfile(path):
+        if not path:
+            self.tray.showMessage(
+                APP_NAME, "还没有设置壁纸视频。\n右键托盘图标 → 更换壁纸视频…",
+                QSystemTrayIcon.Information, 6000,
+            )
+            self._refresh_menu()
+            return
+        if not os.path.isfile(path):
             self.tray.showMessage(
                 APP_NAME, f"找不到视频文件：\n{path}", QSystemTrayIcon.Warning, 6000,
             )
@@ -543,11 +562,10 @@ class WallpaperApp:
 
         self.act_autostart = QAction("开机自动启动", self.menu)
         self.act_autostart.setCheckable(True)
-        try:
-            import autostart
-            self.act_autostart.setChecked(autostart.is_enabled())
-        except Exception:
+        if autostart is None:
             self.act_autostart.setEnabled(False)
+        else:
+            self.act_autostart.setChecked(self._autostart_enabled())
         self.act_autostart.triggered.connect(self._on_toggle_autostart)
         self.menu.addAction(self.act_autostart)
         self.menu.addSeparator()
@@ -575,11 +593,17 @@ class WallpaperApp:
         where = screen.name() if screen is not None else "?"
         self.act_status.setText(f"{state} · {where[:18]} · {name[:18]}")
         self.act_toggle.setText("继续播放" if self.user_paused else "暂停播放")
+        if autostart is not None:
+            self.act_autostart.setChecked(self._autostart_enabled())
+
+    @staticmethod
+    def _autostart_enabled() -> bool:
+        if autostart is None:
+            return False
         try:
-            import autostart
-            self.act_autostart.setChecked(autostart.is_enabled())
-        except Exception:
-            pass
+            return autostart.is_enabled()
+        except OSError:
+            return False
 
     def _rebuild_screen_menu(self) -> None:
         """每次打开菜单时重建显示器列表（插拔显示器后自动刷新）。"""
@@ -611,10 +635,11 @@ class WallpaperApp:
         save_config(self.cfg)
 
     def _on_toggle_autostart(self, checked: bool) -> None:
+        if autostart is None:
+            return
         try:
-            import autostart
             autostart.set_enabled(bool(checked))
-        except Exception as exc:  # pragma: no cover
+        except OSError as exc:  # pragma: no cover
             self.tray.showMessage(APP_NAME, f"设置开机自启失败：{exc}",
                                   QSystemTrayIcon.Warning, 5000)
         self._refresh_menu()
